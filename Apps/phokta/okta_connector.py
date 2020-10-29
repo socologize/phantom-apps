@@ -1,5 +1,5 @@
 # File: okta_connector.py
-# Copyright (c) 2018-2019 Splunk Inc.
+# Copyright (c) 2018-2020 Splunk Inc.
 #
 # Licensed under Apache 2.0 (https://www.apache.org/licenses/LICENSE-2.0.txt)
 #
@@ -15,6 +15,7 @@ from okta_consts import *
 import requests
 import json
 from bs4 import BeautifulSoup
+import time
 
 
 class RetVal(tuple):
@@ -36,7 +37,7 @@ class OktaConnector(BaseConnector):
         # modify this as you deem fit.
         self._base_url = None
 
-    def _process_empty_reponse(self, response, action_result):
+    def _process_empty_response(self, response, action_result):
 
         if response.status_code == 200:
             return RetVal(phantom.APP_SUCCESS, {})
@@ -133,7 +134,7 @@ class OktaConnector(BaseConnector):
 
         # it's not content-type that is to be parsed, handle an empty response
         if not r.text:
-            return self._process_empty_reponse(r, action_result)
+            return self._process_empty_response(r, action_result)
 
         # everything else is actually an error at this point
         message = "Can't process response from server. Status Code: {0} Data from server: {1}".format(
@@ -661,6 +662,78 @@ class OktaConnector(BaseConnector):
             return action_result.get_status()
         return action_result.set_status(phantom.APP_ERROR)
 
+    def _handle_send_push_notification(self, param):
+
+        self.save_progress("In action handler for: {0}".format(self.get_action_identifier()))
+
+        # Add an action result object to self (BaseConnector) to represent the action for this param
+        action_result = self.add_action_result(ActionResult(dict(param)))
+
+        user_id = param['email']
+        factor_type = param.get('factortype', 'push')
+
+        # get user
+        ret_val, response_user = self._make_rest_call('/users/{}'.format(user_id), action_result, method='get')
+        if (phantom.is_fail(ret_val)):
+            self.save_progress("[-] Okta /users/{}: {}".format(user_id, str(response_user)))
+            return action_result.get_status()
+
+        # get factors
+        user_id = response_user['id']
+        ret_val, response_factor = self._make_rest_call('/users/{}/factors'.format(user_id), action_result, method='get')
+        if (phantom.is_fail(ret_val)):
+            self.save_progress("[-] get factors: {}".format(user_id, str(response_factor)))
+            return action_result.get_status()
+
+        # process factors
+        for factor in response_factor:
+            factor_link_verify_href = factor.get('_links', {}).get('verify', {}).get('href', {})
+            if factor_type in factor['factorType'] and len(factor_link_verify_href) > 0:
+                self.save_progress("[-] process factor -- factor_link_verify_href: " + factor_link_verify_href)
+                factor_link_verify_uri = factor_link_verify_href.split('v1')[1]
+        if not factor_link_verify_uri:
+            self.save_progress("[-] error retriving factor_type: " + factor_type)
+
+        # call verify
+        ret_val, response_verify = self._make_rest_call(factor_link_verify_uri, action_result, method='post')
+        if (phantom.is_fail(ret_val)):
+            self.save_progress("[-] send push notification (call verify) {} - {}".format(str(response_verify), factor_link_verify_uri))
+            return action_result.get_status()
+
+        transaction_url = response_verify.get('_links', {}).get('poll', {}).get('href', {})
+        transaction_url = transaction_url.split('v1')[1]
+
+        # response of verify
+        ack_flag = False
+        hard_limit = 25
+        while (ack_flag is False):
+            # Wait for 5 seconds and check result
+            time.sleep(5)
+            hard_limit -= 1
+            self.save_progress("[-] {} - Awaiting Okta Push response".format(hard_limit))
+            ret_val, response_verify_ack = self._make_rest_call(transaction_url, action_result, method='get')
+            if (phantom.is_fail(ret_val)):
+                self.save_progress("[-] Okta Verify ACK (loop): {}".format(str(response_verify_ack)))
+                return action_result.get_status()
+            # self.save_progress("[-] VERIFY ACK: {}".format(response_verify_ack))
+
+            if response_verify_ack['factorResult'] in ["TIMEOUT", "REJECTED", "SUCCESS"] or hard_limit == 0:
+                ack_flag = True
+                self.save_progress("[-] Okta Verify ACK: {}".format(str(response_verify_ack)))
+
+        action_result.add_data(response_verify_ack)
+
+        # Add a dictionary that is made up of the most important values from data into the summary
+        summary = action_result.update_summary({})
+        summary['result'] = response_verify_ack
+
+        # Add the response into the data section
+        action_result.add_data(response_factor)
+
+        # Return success, no need to set the message, only the status
+        # BaseConnector will create a textual message based off of the summary dictionary
+        return action_result.set_status(phantom.APP_SUCCESS, "Successfully sent push notification.")
+
     def handle_action(self, param):
 
         ret_val = phantom.APP_SUCCESS
@@ -712,6 +785,9 @@ class OktaConnector(BaseConnector):
         elif action_id == 'unassign_role':
             ret_val = self._handle_unassign_role(param)
 
+        elif action_id == 'send_push_notification':
+            ret_val = self._handle_send_push_notification(param)
+
         return ret_val
 
     def initialize(self):
@@ -761,8 +837,9 @@ if __name__ == '__main__':
 
     if (username and password):
         try:
-            print ("Accessing the Login page")
-            r = requests.get("https://127.0.0.1/login", verify=False)
+            login_url = BaseConnector._get_phantom_base_url() + '/login'
+            print("Accessing the Login page")
+            r = requests.get(login_url, verify=False)
             csrftoken = r.cookies['csrftoken']
 
             data = dict()
@@ -772,13 +849,13 @@ if __name__ == '__main__':
 
             headers = dict()
             headers['Cookie'] = 'csrftoken=' + csrftoken
-            headers['Referer'] = 'https://127.0.0.1/login'
+            headers['Referer'] = login_url
 
-            print ("Logging into Platform to get the session id")
-            r2 = requests.post("https://127.0.0.1/login", verify=False, data=data, headers=headers)
+            print("Logging into Platform to get the session id")
+            r2 = requests.post(login_url, verify=False, data=data, headers=headers)
             session_id = r2.cookies['sessionid']
         except Exception as e:
-            print ("Unable to get session id from the platfrom. Error: " + str(e))
+            print("Unable to get session id from the platfrom. Error: " + str(e))
             exit(1)
 
     with open(args.input_test_json) as f:
@@ -794,6 +871,6 @@ if __name__ == '__main__':
             connector._set_csrf_info(csrftoken, headers['Referer'])
 
         ret_val = connector._handle_action(json.dumps(in_json), None)
-        print (json.dumps(json.loads(ret_val), indent=4))
+        print(json.dumps(json.loads(ret_val), indent=4))
 
     exit(0)
